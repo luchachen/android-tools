@@ -36,12 +36,14 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${VAR_ZERO_INIT_FLAGS}")
 # GCC which causes it to emit lots of warnings. Since these attributes
 # don't seem to effect runtime behaviour simply disable the warnings.
 add_compile_options(-Wno-attributes)
+add_compile_options(-fPIC)
 
 # libfsmgr (required by fastboot) requires a 64-bit off_t for lseek. On
 # 32-bit glibc platforms this is not the case by default.
 add_compile_definitions(_FILE_OFFSET_BITS=64 _LARGEFILE64_SOURCE)
 
 set(android-vendored
+	bionic
 	avb
 	adb
 	base
@@ -103,6 +105,7 @@ include_directories(${CMAKE_CURRENT_BINARY_DIR})
 include(CMakeLists.libbase.txt)
 include(CMakeLists.libandroidfw.txt)
 include(CMakeLists.adb.txt)
+include(CMakeLists.sysprop.txt)
 include(CMakeLists.sparse.txt)
 include(CMakeLists.fastboot.txt)
 include(CMakeLists.f2fstools.txt)
@@ -116,6 +119,8 @@ include(CMakeLists.avb.txt)
 install(TARGETS
 	"${ANDROID_MKE2FS_NAME}"
 	adb
+	propd
+	toolbox
 	append2simg
 	fastboot
 	img2simg

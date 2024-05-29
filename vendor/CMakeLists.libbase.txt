@@ -18,5 +18,6 @@ add_library(libbase STATIC
     libbase/errors_unix.cpp)
 
 target_include_directories(libbase PUBLIC
+	sysprop/bionic/libc/include
 	libbase/include core/include)
 target_link_libraries(libbase PUBLIC fmt::fmt liblog)

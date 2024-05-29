@@ -1,0 +1,116 @@
+protobuf_generate_cpp(PERSISTENT_PROPERTIES_PROTO_SRCS PERSISTENT_PROPERTIES_PROTO_HDRS
+	core/init/persistent_properties.proto)
+protobuf_generate_cpp(PROPERTY_SERVICE_PROTO_SRCS PROPERTY_SERVICE_PROTO_HDRS
+	core/init/property_service.proto)
+
+# No fastdeploy because it requires deployagent.inc
+set(propd_helpers_SOURCES
+	core/init/persistent_properties.cpp
+	core/init/property_service.cpp
+	core/init/property_type.cpp
+	core/init/epoll.cpp
+	core/init/util.cpp
+	${PERSISTENT_PROPERTIES_PROTO_SRCS} ${PERSISTENT_PROPERTIES_PROTO_HDRS}
+	${PROPERTY_SERVICE_PROTO_SRCS} ${PROPERTY_SERVICE_PROTO_HDRS})
+
+
+add_library(propd_helpers SHARED ${propd_helpers_SOURCES})
+target_compile_definitions(propd_helpers PRIVATE -D_GNU_SOURCE)
+target_compile_definitions(propd_helpers PUBLIC -DPROP_HOST=1)
+target_include_directories(propd_helpers PUBLIC
+	core/init)
+
+target_link_libraries(propd_helpers PRIVATE propertyinfoserializer libbase systemproperties)
+
+#core/property_service/property_info_checker/property_info_checker.cpp
+set(propertyinfoparser_SOURCES
+	core/property_service/libpropertyinfoparser/property_info_parser.cpp)
+
+add_library(propertyinfoparser OBJECT ${propertyinfoparser_SOURCES})
+target_compile_definitions(propertyinfoparser PRIVATE -D_GNU_SOURCE)
+target_compile_definitions(propertyinfoparser PUBLIC -DPROP_HOST=1 -DALLOW_LOCAL_PROP_OVERRIDE=1)
+
+target_include_directories(propertyinfoparser PUBLIC
+	core/property_service/libpropertyinfoparser/include)
+
+#core/property_service/libpropertyinfoserializer/property_info_serializer_test.cpp
+#core/property_service/libpropertyinfoserializer/trie_builder_test.cpp
+set(propertyinfoserializer_SOURCES
+	core/property_service/libpropertyinfoserializer/property_info_serializer.cpp
+	core/property_service/libpropertyinfoserializer/trie_serializer.cpp
+	core/property_service/libpropertyinfoserializer/trie_builder.cpp
+	core/property_service/libpropertyinfoserializer/property_info_file.cpp)
+
+add_library(propertyinfoserializer SHARED ${propertyinfoserializer_SOURCES})
+target_compile_definitions(propertyinfoserializer PRIVATE -D_GNU_SOURCE)
+target_compile_definitions(propertyinfoserializer PUBLIC -DPROP_HOST=1 -DALLOW_LOCAL_PROP_OVERRIDE=1)
+
+target_include_directories(propertyinfoserializer PUBLIC
+	core/property_service/libpropertyinfoserializer/include)
+
+target_link_libraries(propertyinfoserializer PRIVATE libbase systemproperties)
+
+set(systemproperties_SOURCES
+	bionic/libc/system_properties/context_node.cpp
+	bionic/libc/system_properties/contexts_serialized.cpp
+	bionic/libc/system_properties/contexts_split.cpp
+	bionic/libc/system_properties/prop_area.cpp
+	bionic/libc/system_properties/prop_info.cpp
+	bionic/libc/bionic/system_property_set.cpp
+	bionic/libc/bionic/system_property_api.cpp
+	bionic/libc/system_properties/system_properties.cpp
+	bionic/libc/upstream-openbsd/lib/libc/string/strlcpy.c
+	sysprop/bionic/libc/async_safe/async_safe_log.cpp)
+
+add_library(systemproperties SHARED ${systemproperties_SOURCES})
+target_compile_definitions(systemproperties PRIVATE -D_GNU_SOURCE)
+target_compile_definitions(systemproperties PUBLIC -DPROP_HOST=1)
+target_include_directories(systemproperties PRIVATE
+	sysprop/bionic/libc/
+	sysprop/bionic/libc/async_safe/include
+	bionic/libc/system_properties/include)
+
+target_include_directories(systemproperties PUBLIC
+	sysprop/bionic/libc/include)
+
+target_link_libraries(systemproperties PUBLIC propertyinfoparser)
+
+add_executable(propd
+	sysprop/propd/propd.cpp)
+
+target_link_libraries(propd
+	libbase
+	propd_helpers
+	systemproperties
+	protobuf::libprotobuf-lite)
+
+add_executable(toolbox
+	core/toolbox/toolbox.c
+	core/toolbox/getprop.cpp
+	core/toolbox/setprop.cpp)
+
+target_link_libraries(toolbox
+	libbase
+	systemproperties)
+
+add_custom_command(
+	TARGET toolbox POST_BUILD
+	COMMAND ${CMAKE_COMMAND} -E create_symlink toolbox getprop
+	COMMAND ${CMAKE_COMMAND} -E create_symlink toolbox setprop
+	COMMENT "Creating setprop and getprop symlink to the executable toolbox"
+	VERBATIM)
+
+add_custom_command(
+	OUTPUT getprop
+	COMMAND ${CMAKE_COMMAND} -E create_symlink toolbox getprop
+	COMMENT "Creating getprop symlink to the executable"
+)
+
+add_custom_command(
+	OUTPUT setprop
+	COMMAND ${CMAKE_COMMAND} -E create_symlink toolbox setprop
+	COMMENT "Creating setprop symlink to the executable"
+)
+
+add_custom_target(setprop ALL DEPENDS toolbox)
+add_custom_target(getprop ALL DEPENDS toolbox)
