@@ -1,0 +1,31 @@
+From 6b6a81101ee4ea30b19332b4598260d9bcaf7234 Mon Sep 17 00:00:00 2001
+From: chunhuachen <chunhuachen@ruijie.com.cn>
+Date: Thu, 30 May 2024 21:05:25 +0800
+Subject: [PATCH 2/2] libsysprop must init after libc
+
+---
+ libc/bionic/system_property_api.cpp | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/libc/bionic/system_property_api.cpp b/libc/bionic/system_property_api.cpp
+index a641f12a8..9c00c45d0 100644
+--- a/libc/bionic/system_property_api.cpp
++++ b/libc/bionic/system_property_api.cpp
+@@ -43,6 +43,14 @@ static_assert(__is_trivially_constructible(SystemProperties),
+ __BIONIC_WEAK_VARIABLE_FOR_NATIVE_BRIDGE
+ prop_area* __system_property_area__ = nullptr;
+ 
++extern "C" char** environ;
++__attribute__((constructor)) static void __libsysprop_preinit() {
++  //after environ
++  if (environ) {
++      __system_properties_init();
++  }
++}
++
+ __BIONIC_WEAK_FOR_NATIVE_BRIDGE
+ int __system_properties_init() {
+   return system_properties.Init(PROP_FILENAME) ? 0 : -1;
+-- 
+2.34.1
+

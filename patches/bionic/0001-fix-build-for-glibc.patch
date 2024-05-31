@@ -1,0 +1,77 @@
+From d93254717bb635b046d76841718ac2844e66bf30 Mon Sep 17 00:00:00 2001
+From: chunhuachen <chunhuachen@ruijie.com.cn>
+Date: Thu, 30 May 2024 11:44:13 +0800
+Subject: [PATCH 1/2] fix build for glibc
+
+---
+ libc/bionic/system_property_set.cpp          | 2 +-
+ libc/include/sys/_system_properties.h        | 4 ++--
+ libc/system_properties/prop_area.cpp         | 3 +++
+ libc/system_properties/system_properties.cpp | 2 +-
+ 4 files changed, 7 insertions(+), 4 deletions(-)
+
+diff --git a/libc/bionic/system_property_set.cpp b/libc/bionic/system_property_set.cpp
+index 212aafcc1..656e43317 100644
+--- a/libc/bionic/system_property_set.cpp
++++ b/libc/bionic/system_property_set.cpp
+@@ -48,7 +48,7 @@
+ #include "platform/bionic/macros.h"
+ #include "private/ScopedFd.h"
+ 
+-static const char property_service_socket[] = "/dev/socket/" PROP_SERVICE_NAME;
++static const char property_service_socket[] = "/run/" PROP_SERVICE_NAME;
+ static const char* kServiceVersionPropertyName = "ro.property_service.version";
+ 
+ class PropertyServiceConnection {
+diff --git a/libc/include/sys/_system_properties.h b/libc/include/sys/_system_properties.h
+index 744a45b71..82c5c713f 100644
+--- a/libc/include/sys/_system_properties.h
++++ b/libc/include/sys/_system_properties.h
+@@ -40,8 +40,8 @@
+ 
+ __BEGIN_DECLS
+ 
+-#define PROP_SERVICE_NAME "property_service"
+-#define PROP_FILENAME "/dev/__properties__"
++#define PROP_SERVICE_NAME "property_service.socket"
++#define PROP_FILENAME "/run/__properties__"
+ 
+ #define PROP_MSG_SETPROP 1
+ #define PROP_MSG_SETPROP2 0x00020001
+diff --git a/libc/system_properties/prop_area.cpp b/libc/system_properties/prop_area.cpp
+index 42bee9f3e..de84fbe90 100644
+--- a/libc/system_properties/prop_area.cpp
++++ b/libc/system_properties/prop_area.cpp
+@@ -40,6 +40,7 @@
+ #include <new>
+ 
+ #include <async_safe/log.h>
++#include <linux/xattr.h>
+ 
+ constexpr size_t PA_SIZE = 128 * 1024;
+ constexpr uint32_t PROP_AREA_MAGIC = 0x504f5250;
+@@ -62,6 +63,8 @@ prop_area* prop_area::map_prop_area_rw(const char* filename, const char* context
+        */
+       abort();
+     }
++    async_safe_format_log(ANDROID_LOG_ERROR, "libc",
++            "open failed  (%s) for \"%s\"", context, filename);
+     return nullptr;
+   }
+ 
+diff --git a/libc/system_properties/system_properties.cpp b/libc/system_properties/system_properties.cpp
+index 1cb15c3df..8c967f238 100644
+--- a/libc/system_properties/system_properties.cpp
++++ b/libc/system_properties/system_properties.cpp
+@@ -73,7 +73,7 @@ bool SystemProperties::Init(const char* filename) {
+   strcpy(property_filename_, filename);
+ 
+   if (is_dir(property_filename_)) {
+-    if (access("/dev/__properties__/property_info", R_OK) == 0) {
++    if (access("/run/__properties__/property_info", R_OK) == 0) {
+       contexts_ = new (contexts_data_) ContextsSerialized();
+       if (!contexts_->Initialize(false, property_filename_, nullptr)) {
+         return false;
+-- 
+2.34.1
+

@@ -1,0 +1,1202 @@
+From d3239aea6cf8d88c5616e72ccc1e9721d55cd9d3 Mon Sep 17 00:00:00 2001
+From: chunhuachen <chunhuachen@ruijie.com.cn>
+Date: Wed, 29 May 2024 14:03:04 +0800
+Subject: [PATCH 2/2] fix build addd property_service for glibc
+
+---
+ init/epoll.cpp                                |   7 +-
+ init/init.h                                   |  11 -
+ init/persistent_properties.h                  |   4 +
+ init/property_service.cpp                     | 332 +------------
+ init/subcontext.h                             |  42 --
+ init/util.cpp                                 | 470 ++----------------
+ .../trie_node_arena.h                         |   3 +
+ 7 files changed, 71 insertions(+), 798 deletions(-)
+
+diff --git a/init/epoll.cpp b/init/epoll.cpp
+index cd73a0c3df..bef75f72a1 100644
+--- a/init/epoll.cpp
++++ b/init/epoll.cpp
+@@ -47,16 +47,17 @@ Result<void> Epoll::RegisterHandler(int fd, Handler handler, uint32_t events) {
+ 
+     auto [it, inserted] = epoll_handlers_.emplace(
+             fd, Info{
+-                        .events = events,
+                         .handler = std::move(handler),
++                        .events = events,
+                 });
+     if (!inserted) {
+         return Error() << "Cannot specify two epoll handlers for a given FD";
+     }
+-    epoll_event ev = {
++    epoll_event ev {
+             .events = events,
+-            .data.fd = fd,
+     };
++
++    ev.data.fd = fd;
+     if (epoll_ctl(epoll_fd_.get(), EPOLL_CTL_ADD, fd, &ev) == -1) {
+         Result<void> result = ErrnoError() << "epoll_ctl failed to add fd";
+         epoll_handlers_.erase(fd);
+diff --git a/init/init.h b/init/init.h
+index 9c7e91879a..a80aad698c 100644
+--- a/init/init.h
++++ b/init/init.h
+@@ -20,16 +20,9 @@
+ 
+ #include <string>
+ 
+-#include "action.h"
+-#include "action_manager.h"
+-#include "parser.h"
+-#include "service_list.h"
+-
+ namespace android {
+ namespace init {
+ 
+-Parser CreateParser(ActionManager& action_manager, ServiceList& service_list);
+-Parser CreateApexConfigParser(ActionManager& action_manager, ServiceList& service_list);
+ 
+ bool start_waiting_for_property(const char *name, const char *value);
+ 
+@@ -44,9 +37,5 @@ bool QueueControlMessage(const std::string& message, const std::string& name, pi
+ 
+ int SecondStageMain(int argc, char** argv);
+ 
+-int StopServicesFromApex(const std::string& apex_name);
+-
+-void RemoveServiceAndActionFromApex(const std::string& apex_name);
+-
+ }  // namespace init
+ }  // namespace android
+diff --git a/init/persistent_properties.h b/init/persistent_properties.h
+index 11083da9e1..3dd0c674e7 100644
+--- a/init/persistent_properties.h
++++ b/init/persistent_properties.h
+@@ -20,7 +20,11 @@
+ #include <string>
+ 
+ #include "result.h"
++#ifndef _GNU_SOURCE
+ #include "system/core/init/persistent_properties.pb.h"
++#else
++#include "persistent_properties.pb.h"
++#endif
+ 
+ namespace android {
+ namespace init {
+diff --git a/init/property_service.cpp b/init/property_service.cpp
+index 4aa99577d1..9e2e57af4f 100644
+--- a/init/property_service.cpp
++++ b/init/property_service.cpp
+@@ -16,7 +16,18 @@
+ 
+ #include "property_service.h"
+ 
++#ifdef __ANDROID__
+ #include <android/api-level.h>
++#else
++// android/api-level.h
++#define __ANDROID_API_P__ 28
++#define __ANDROID_API_Q__ 29
++#define __ANDROID_API_R__ 30
++#define __ANDROID_API_S__ 31
++#define __ANDROID_API_T__ 33
++#define __ANDROID_API_U__ 34
++#endif
++
+ #include <ctype.h>
+ #include <errno.h>
+ #include <fcntl.h>
+@@ -48,7 +59,6 @@
+ #include <thread>
+ #include <vector>
+ 
+-#include <InitProperties.sysprop.h>
+ #include <android-base/chrono_utils.h>
+ #include <android-base/file.h>
+ #include <android-base/logging.h>
+@@ -57,25 +67,18 @@
+ #include <android-base/result.h>
+ #include <android-base/stringprintf.h>
+ #include <android-base/strings.h>
+-#include <fs_mgr.h>
+ #include <private/android_filesystem_config.h>
+ #include <property_info_parser/property_info_parser.h>
+ #include <property_info_serializer/property_info_serializer.h>
+-#include <selinux/android.h>
+-#include <selinux/label.h>
+-#include <selinux/selinux.h>
+-#include <vendorsupport/api_level.h>
+ 
+-#include "debug_ramdisk.h"
+ #include "epoll.h"
+ #include "init.h"
+ #include "persistent_properties.h"
+ #include "property_type.h"
+ #include "proto_utils.h"
+ #include "second_stage_resources.h"
+-#include "selinux.h"
+ #include "subcontext.h"
+-#include "system/core/init/property_service.pb.h"
++#include "property_service.pb.h"
+ #include "util.h"
+ 
+ static constexpr char APPCOMPAT_OVERRIDE_PROP_FOLDERNAME[] =
+@@ -102,7 +105,6 @@ using android::properties::BuildTrie;
+ using android::properties::ParsePropertyInfoFile;
+ using android::properties::PropertyInfoAreaFile;
+ using android::properties::PropertyInfoEntry;
+-using android::sysprop::InitProperties::is_userspace_reboot_supported;
+ 
+ namespace android {
+ namespace init {
+@@ -134,19 +136,6 @@ struct PropertyAuditData {
+     const char* name;
+ };
+ 
+-static int PropertyAuditCallback(void* data, security_class_t /*cls*/, char* buf, size_t len) {
+-    auto* d = reinterpret_cast<PropertyAuditData*>(data);
+-
+-    if (!d || !d->name || !d->cr) {
+-        LOG(ERROR) << "AuditCallback invoked with null data arguments!";
+-        return 0;
+-    }
+-
+-    snprintf(buf, len, "property=%s pid=%d uid=%d gid=%d", d->name, d->cr->pid, d->cr->uid,
+-             d->cr->gid);
+-    return 0;
+-}
+-
+ void StartSendingMessages() {
+     auto lock = std::lock_guard{accept_messages_lock};
+     accept_messages = true;
+@@ -157,37 +146,6 @@ void StopSendingMessages() {
+     accept_messages = false;
+ }
+ 
+-bool CanReadProperty(const std::string& source_context, const std::string& name) {
+-    const char* target_context = nullptr;
+-    property_info_area->GetPropertyInfo(name.c_str(), &target_context, nullptr);
+-
+-    PropertyAuditData audit_data;
+-
+-    audit_data.name = name.c_str();
+-
+-    ucred cr = {.pid = 0, .uid = 0, .gid = 0};
+-    audit_data.cr = &cr;
+-
+-    return selinux_check_access(source_context.c_str(), target_context, "file", "read",
+-                                &audit_data) == 0;
+-}
+-
+-static bool CheckMacPerms(const std::string& name, const char* target_context,
+-                          const char* source_context, const ucred& cr) {
+-    if (!target_context || !source_context) {
+-        return false;
+-    }
+-
+-    PropertyAuditData audit_data;
+-
+-    audit_data.name = name.c_str();
+-    audit_data.cr = &cr;
+-
+-    bool has_access = (selinux_check_access(source_context, target_context, "property_service",
+-                                            "set", &audit_data) == 0);
+-
+-    return has_access;
+-}
+ 
+ void NotifyPropertyChange(const std::string& name, const std::string& value) {
+     // If init hasn't started its main loop, then it won't be handling property changed messages
+@@ -219,9 +177,10 @@ class AsyncRestorecon {
+             paths_.pop();
+ 
+             lock.unlock();
+-            if (selinux_android_restorecon(path.c_str(), SELINUX_ANDROID_RESTORECON_RECURSE) != 0) {
++            //TODO
++            //if (selinux_android_restorecon(path.c_str(), SELINUX_ANDROID_RESTORECON_RECURSE) != 0) {
+                 LOG(ERROR) << "Asynchronous restorecon of '" << path << "' failed'";
+-            }
++            //}
+             android::base::SetProperty(kRestoreconProperty, path);
+             lock.lock();
+         }
+@@ -284,12 +243,7 @@ class SocketConnection {
+     }
+ 
+     bool GetSourceContext(std::string* source_context) const {
+-        char* c_source_context = nullptr;
+-        if (getpeercon(socket_.get(), &c_source_context) != 0) {
+-            return false;
+-        }
+-        *source_context = c_source_context;
+-        freecon(c_source_context);
++        //TODO
+         return true;
+     }
+ 
+@@ -442,128 +396,22 @@ static uint32_t PropertySetNoSocket(const std::string& name, const std::string&
+     return *ret;
+ }
+ 
+-static uint32_t SendControlMessage(const std::string& msg, const std::string& name, pid_t pid,
+-                                   SocketConnection* socket, std::string* error) {
+-    auto lock = std::lock_guard{accept_messages_lock};
+-    if (!accept_messages) {
+-        *error = "Received control message after shutdown, ignoring";
+-        return PROP_ERROR_HANDLE_CONTROL_MESSAGE;
+-    }
+-
+-    // We must release the fd before sending it to init, otherwise there will be a race with init.
+-    // If init calls close() before Release(), then fdsan will see the wrong tag and abort().
+-    int fd = -1;
+-    if (socket != nullptr && SelinuxGetVendorAndroidVersion() > __ANDROID_API_Q__) {
+-        fd = socket->Release();
+-    }
+-
+-    bool queue_success = QueueControlMessage(msg, name, pid, fd);
+-    if (!queue_success && fd != -1) {
+-        uint32_t response = PROP_ERROR_HANDLE_CONTROL_MESSAGE;
+-        TEMP_FAILURE_RETRY(send(fd, &response, sizeof(response), 0));
+-        close(fd);
+-    }
+-
+-    return PROP_SUCCESS;
+-}
+-
+-bool CheckControlPropertyPerms(const std::string& name, const std::string& value,
+-                               const std::string& source_context, const ucred& cr) {
+-    // We check the legacy method first but these properties are dontaudit, so we only log an audit
+-    // if the newer method fails as well.  We only do this with the legacy ctl. properties.
+-    if (name == "ctl.start" || name == "ctl.stop" || name == "ctl.restart") {
+-        // The legacy permissions model is that ctl. properties have their name ctl.<action> and
+-        // their value is the name of the service to apply that action to.  Permissions for these
+-        // actions are based on the service, so we must create a fake name of ctl.<service> to
+-        // check permissions.
+-        auto control_string_legacy = "ctl." + value;
+-        const char* target_context_legacy = nullptr;
+-        const char* type_legacy = nullptr;
+-        property_info_area->GetPropertyInfo(control_string_legacy.c_str(), &target_context_legacy,
+-                                            &type_legacy);
+-
+-        if (CheckMacPerms(control_string_legacy, target_context_legacy, source_context.c_str(), cr)) {
+-            return true;
+-        }
+-    }
+-
+-    auto control_string_full = name + "$" + value;
+-    const char* target_context_full = nullptr;
+-    const char* type_full = nullptr;
+-    property_info_area->GetPropertyInfo(control_string_full.c_str(), &target_context_full,
+-                                        &type_full);
+-
+-    return CheckMacPerms(control_string_full, target_context_full, source_context.c_str(), cr);
+-}
+-
+ // This returns one of the enum of PROP_SUCCESS or PROP_ERROR*.
+ uint32_t CheckPermissions(const std::string& name, const std::string& value,
+                           const std::string& source_context, const ucred& cr, std::string* error) {
+-    if (!IsLegalPropertyName(name)) {
+-        *error = "Illegal property name";
+-        return PROP_ERROR_INVALID_NAME;
+-    }
+-
+-    if (StartsWith(name, "ctl.")) {
+-        if (!CheckControlPropertyPerms(name, value, source_context, cr)) {
+-            *error = StringPrintf("Invalid permissions to perform '%s' on '%s'", name.c_str() + 4,
+-                                  value.c_str());
+-            return PROP_ERROR_HANDLE_CONTROL_MESSAGE;
+-        }
+-
+-        return PROP_SUCCESS;
+-    }
+-
+-    const char* target_context = nullptr;
+-    const char* type = nullptr;
+-    property_info_area->GetPropertyInfo(name.c_str(), &target_context, &type);
+-
+-    if (!CheckMacPerms(name, target_context, source_context.c_str(), cr)) {
+-        *error = "SELinux permission check failed";
+-        return PROP_ERROR_PERMISSION_DENIED;
+-    }
+-
+-    if (!CheckType(type, value)) {
+-        *error = StringPrintf("Property type check failed, value doesn't match expected type '%s'",
+-                              (type ?: "(null)"));
+-        return PROP_ERROR_INVALID_VALUE;
+-    }
+-
+     return PROP_SUCCESS;
+ }
+ 
++int SelinuxGetVendorAndroidVersion() {
++        // As of now Microdroid doesn't have any vendor code.
++        return 0;
++}
++
+ // This returns one of the enum of PROP_SUCCESS or PROP_ERROR*, or std::nullopt
+ // if asynchronous.
+ std::optional<uint32_t> HandlePropertySet(const std::string& name, const std::string& value,
+                                           const std::string& source_context, const ucred& cr,
+                                           SocketConnection* socket, std::string* error) {
+-    if (auto ret = CheckPermissions(name, value, source_context, cr, error); ret != PROP_SUCCESS) {
+-        return {ret};
+-    }
+-
+-    if (StartsWith(name, "ctl.")) {
+-        return {SendControlMessage(name.c_str() + 4, value, cr.pid, socket, error)};
+-    }
+-
+-    // sys.powerctl is a special property that is used to make the device reboot.  We want to log
+-    // any process that sets this property to be able to accurately blame the cause of a shutdown.
+-    if (name == "sys.powerctl") {
+-        std::string cmdline_path = StringPrintf("proc/%d/cmdline", cr.pid);
+-        std::string process_cmdline;
+-        std::string process_log_string;
+-        if (ReadFileToString(cmdline_path, &process_cmdline)) {
+-            // Since cmdline is null deliminated, .c_str() conveniently gives us just the process
+-            // path.
+-            process_log_string = StringPrintf(" (%s)", process_cmdline.c_str());
+-        }
+-        LOG(INFO) << "Received sys.powerctl='" << value << "' from pid: " << cr.pid
+-                  << process_log_string;
+-        if (value == "reboot,userspace" && !is_userspace_reboot_supported().value_or(false)) {
+-            *error = "Userspace reboot is not supported by this device";
+-            return {PROP_ERROR_INVALID_VALUE};
+-        }
+-    }
+-
+     // If a process other than init is writing a non-empty value, it means that process is
+     // requesting that init performs a restorecon operation on the path specified by 'value'.
+     // We use a thread to do this restorecon operation to prevent holding up init, as it may take
+@@ -833,23 +681,6 @@ static void LoadPropertiesFromSecondStageRes(std::map<std::string, std::string>*
+     }
+ }
+ 
+-// persist.sys.usb.config values can't be combined on build-time when property
+-// files are split into each partition.
+-// So we need to apply the same rule of build/make/tools/post_process_props.py
+-// on runtime.
+-static void update_sys_usb_config() {
+-    bool is_debuggable = android::base::GetBoolProperty("ro.debuggable", false);
+-    std::string config = android::base::GetProperty("persist.sys.usb.config", "");
+-    // b/150130503, add (config == "none") condition here to prevent appending
+-    // ",adb" if "none" is explicitly defined in default prop.
+-    if (config.empty() || config == "none") {
+-        InitPropertySet("persist.sys.usb.config", is_debuggable ? "adb" : "none");
+-    } else if (is_debuggable && config.find("adb") == std::string::npos &&
+-               config.length() + 4 < PROP_VALUE_MAX) {
+-        config.append(",adb");
+-        InitPropertySet("persist.sys.usb.config", config);
+-    }
+-}
+ 
+ static void load_override_properties() {
+     if (ALLOW_LOCAL_PROP_OVERRIDE) {
+@@ -1088,61 +919,12 @@ static void property_initialize_ro_cpu_abilist() {
+     }
+ }
+ 
+-static void property_initialize_ro_vendor_api_level() {
+-    // ro.vendor.api_level shows the api_level that the vendor images (vendor, odm, ...) are
+-    // required to support.
+-    constexpr auto VENDOR_API_LEVEL_PROP = "ro.vendor.api_level";
+-
+-    if (__system_property_find(VENDOR_API_LEVEL_PROP) != nullptr) {
+-        // The device already have ro.vendor.api_level in its vendor/build.prop.
+-        // Skip initializing the ro.vendor.api_level property.
+-        return;
+-    }
+-
+-    auto vendor_api_level = GetIntProperty("ro.board.first_api_level", __ANDROID_VENDOR_API_MAX__);
+-    if (vendor_api_level != __ANDROID_VENDOR_API_MAX__) {
+-        // Update the vendor_api_level with "ro.board.api_level" only if both "ro.board.api_level"
+-        // and "ro.board.first_api_level" are defined.
+-        vendor_api_level = GetIntProperty("ro.board.api_level", vendor_api_level);
+-    }
+-
+-    auto product_first_api_level =
+-            GetIntProperty("ro.product.first_api_level", __ANDROID_API_FUTURE__);
+-    if (product_first_api_level == __ANDROID_API_FUTURE__) {
+-        // Fallback to "ro.build.version.sdk" if the "ro.product.first_api_level" is not defined.
+-        product_first_api_level = GetIntProperty("ro.build.version.sdk", __ANDROID_API_FUTURE__);
+-    }
+-
+-    vendor_api_level =
+-            std::min(AVendorSupport_getVendorApiLevelOf(product_first_api_level), vendor_api_level);
+-
+-    if (vendor_api_level < 0) {
+-        LOG(ERROR) << "Unexpected vendor api level for " << VENDOR_API_LEVEL_PROP << ". Check "
+-                   << "ro.product.first_api_level and ro.build.version.sdk.";
+-        vendor_api_level = __ANDROID_VENDOR_API_MAX__;
+-    }
+-
+-    std::string error;
+-    auto res = PropertySetNoSocket(VENDOR_API_LEVEL_PROP, std::to_string(vendor_api_level), &error);
+-    if (res != PROP_SUCCESS) {
+-        LOG(ERROR) << "Failed to set " << VENDOR_API_LEVEL_PROP << " with " << vendor_api_level
+-                   << ": " << error << "(" << res << ")";
+-    }
+-}
+-
+ void PropertyLoadBootDefaults() {
+     // We read the properties and their values into a map, in order to always allow properties
+     // loaded in the later property files to override the properties in loaded in the earlier
+     // property files, regardless of if they are "ro." properties or not.
+     std::map<std::string, std::string> properties;
+ 
+-    if (IsRecoveryMode()) {
+-        if (auto res = load_properties_from_file("/prop.default", nullptr, &properties);
+-            !res.ok()) {
+-            LOG(ERROR) << res.error();
+-        }
+-    }
+-
+     // /<part>/etc/build.prop is the canonical location of the build-time properties since S.
+     // Falling back to /<part>/defalt.prop and /<part>/build.prop only when legacy path has to
+     // be supported, which is controlled by the support_legacy_path_until argument.
+@@ -1198,23 +980,15 @@ void PropertyLoadBootDefaults() {
+     load_properties_from_file("/system_dlkm/etc/build.prop", nullptr, &properties);
+     // TODO(b/117892318): uncomment the following condition when vendor.imgs for aosp_* targets are
+     // all updated.
+-    // if (SelinuxGetVendorAndroidVersion() <= __ANDROID_API_R__) {
+-    load_properties_from_file("/vendor/default.prop", nullptr, &properties);
+-    // }
++    if (SelinuxGetVendorAndroidVersion() <= __ANDROID_API_R__) {
++        load_properties_from_file("/vendor/default.prop", nullptr, &properties);
++    }
+     load_properties_from_file("/vendor/build.prop", nullptr, &properties);
+     load_properties_from_file("/vendor_dlkm/etc/build.prop", nullptr, &properties);
+     load_properties_from_file("/odm_dlkm/etc/build.prop", nullptr, &properties);
+     load_properties_from_partition("odm", /* support_legacy_path_until */ 28);
+     load_properties_from_partition("product", /* support_legacy_path_until */ 30);
+ 
+-    if (access(kDebugRamdiskProp, R_OK) == 0) {
+-        LOG(INFO) << "Loading " << kDebugRamdiskProp;
+-        if (auto res = load_properties_from_file(kDebugRamdiskProp, nullptr, &properties);
+-            !res.ok()) {
+-            LOG(WARNING) << res.error();
+-        }
+-    }
+-
+     for (const auto& [name, value] : properties) {
+         std::string error;
+         if (PropertySetNoSocket(name, value, &error) != PROP_SUCCESS) {
+@@ -1228,9 +1002,6 @@ void PropertyLoadBootDefaults() {
+     property_derive_build_fingerprint();
+     property_derive_legacy_build_fingerprint();
+     property_initialize_ro_cpu_abilist();
+-    property_initialize_ro_vendor_api_level();
+-
+-    update_sys_usb_config();
+ }
+ 
+ bool LoadPropertyInfoFromFile(const std::string& filename,
+@@ -1299,14 +1070,12 @@ void CreateSerializedPropertyInfo() {
+     if (!WriteStringToFile(serialized_contexts, PROP_TREE_FILE, 0444, 0, 0, false)) {
+         PLOG(ERROR) << "Unable to write serialized property infos to file";
+     }
+-    selinux_android_restorecon(PROP_TREE_FILE, 0);
+ 
+     mkdir(APPCOMPAT_OVERRIDE_PROP_FOLDERNAME, S_IRWXU | S_IXGRP | S_IXOTH);
+     if (!WriteStringToFile(serialized_contexts, APPCOMPAT_OVERRIDE_PROP_TREE_FILE, 0444, 0, 0,
+                            false)) {
+         PLOG(ERROR) << "Unable to write appcompat override property infos to file";
+     }
+-    selinux_android_restorecon(APPCOMPAT_OVERRIDE_PROP_TREE_FILE, 0);
+ }
+ 
+ static void ExportKernelBootProps() {
+@@ -1331,55 +1100,11 @@ static void ExportKernelBootProps() {
+     }
+ }
+ 
+-static void ProcessKernelDt() {
+-    if (!is_android_dt_value_expected("compatible", "android,firmware")) {
+-        return;
+-    }
+-
+-    std::unique_ptr<DIR, int (*)(DIR*)> dir(opendir(android::fs_mgr::GetAndroidDtDir().c_str()),
+-                                            closedir);
+-    if (!dir) return;
+-
+-    std::string dt_file;
+-    struct dirent* dp;
+-    while ((dp = readdir(dir.get())) != NULL) {
+-        if (dp->d_type != DT_REG || !strcmp(dp->d_name, "compatible") ||
+-            !strcmp(dp->d_name, "name")) {
+-            continue;
+-        }
+-
+-        std::string file_name = android::fs_mgr::GetAndroidDtDir() + dp->d_name;
+-
+-        android::base::ReadFileToString(file_name, &dt_file);
+-        std::replace(dt_file.begin(), dt_file.end(), ',', '.');
+-
+-        InitPropertySet("ro.boot."s + dp->d_name, dt_file);
+-    }
+-}
+ 
+ constexpr auto ANDROIDBOOT_PREFIX = "androidboot."sv;
+ 
+-static void ProcessKernelCmdline() {
+-    android::fs_mgr::ImportKernelCmdline([&](const std::string& key, const std::string& value) {
+-        if (StartsWith(key, ANDROIDBOOT_PREFIX)) {
+-            InitPropertySet("ro.boot." + key.substr(ANDROIDBOOT_PREFIX.size()), value);
+-        }
+-    });
+-}
+-
+-
+-static void ProcessBootconfig() {
+-    android::fs_mgr::ImportBootconfig([&](const std::string& key, const std::string& value) {
+-        if (StartsWith(key, ANDROIDBOOT_PREFIX)) {
+-            InitPropertySet("ro.boot." + key.substr(ANDROIDBOOT_PREFIX.size()), value);
+-        }
+-    });
+-}
+ 
+ void PropertyInit() {
+-    selinux_callback cb;
+-    cb.func_audit = PropertyAuditCallback;
+-    selinux_set_callback(SELINUX_CB_AUDIT, cb);
+ 
+     mkdir("/dev/__properties__", S_IRWXU | S_IXGRP | S_IXOTH);
+     CreateSerializedPropertyInfo();
+@@ -1392,9 +1117,7 @@ void PropertyInit() {
+ 
+     // If arguments are passed both on the command line and in DT,
+     // properties set in DT always have priority over the command-line ones.
+-    ProcessKernelDt();
+-    ProcessKernelCmdline();
+-    ProcessBootconfig();
++    //ProcessKernelCmdline();
+ 
+     // Propagate the kernel variables to internal variables
+     // used by init as well as the current required properties.
+@@ -1427,11 +1150,6 @@ static void HandleInitSocket() {
+                 InitPropertySet(prop_name, prop_value);
+             }
+ 
+-            // Apply debug ramdisk special settings after persistent properties are loaded.
+-            if (android::base::GetBoolProperty("ro.force.debuggable", false)) {
+-                // Always enable usb adb if device is booted with debug ramdisk.
+-                update_sys_usb_config();
+-            }
+             InitPropertySet("ro.persistent_properties.ready", "true");
+             persistent_properties_loaded = true;
+             break;
+diff --git a/init/subcontext.h b/init/subcontext.h
+index 93ebacea27..c4d5dcc7eb 100644
+--- a/init/subcontext.h
++++ b/init/subcontext.h
+@@ -23,10 +23,6 @@
+ 
+ #include <android-base/unique_fd.h>
+ 
+-#include "builtins.h"
+-#include "result.h"
+-#include "system/core/init/subcontext.pb.h"
+-
+ namespace android {
+ namespace init {
+ 
+@@ -34,43 +30,5 @@ static constexpr const char kInitContext[] = "u:r:init:s0";
+ static constexpr const char kVendorContext[] = "u:r:vendor_init:s0";
+ static constexpr const char kTestContext[] = "test-test-test";
+ 
+-class Subcontext {
+-  public:
+-    Subcontext(std::vector<std::string> path_prefixes, std::string_view context, bool host = false)
+-        : path_prefixes_(std::move(path_prefixes)),
+-          context_(context.begin(), context.end()),
+-          pid_(0) {
+-        if (!host) {
+-            Fork();
+-        }
+-    }
+-
+-    Result<void> Execute(const std::vector<std::string>& args);
+-    Result<std::vector<std::string>> ExpandArgs(const std::vector<std::string>& args);
+-    void Restart();
+-    bool PathMatchesSubcontext(const std::string& path) const;
+-    void SetApexList(std::vector<std::string>&& apex_list);
+-
+-    const std::string& context() const { return context_; }
+-    pid_t pid() const { return pid_; }
+-
+-  private:
+-    void Fork();
+-    Result<SubcontextReply> TransmitMessage(const SubcontextCommand& subcontext_command);
+-
+-    std::vector<std::string> path_prefixes_;
+-    std::vector<std::string> apex_list_;
+-    std::string context_;
+-    pid_t pid_;
+-    android::base::unique_fd socket_;
+-};
+-
+-int SubcontextMain(int argc, char** argv, const BuiltinFunctionMap* function_map);
+-void InitializeSubcontext();
+-void InitializeHostSubcontext(std::vector<std::string> vendor_prefixes);
+-Subcontext* GetSubcontext();
+-bool SubcontextChildReap(pid_t pid);
+-void SubcontextTerminate();
+-
+ }  // namespace init
+ }  // namespace android
+diff --git a/init/util.cpp b/init/util.cpp
+index e5efc7da61..2f1843dbb0 100644
+--- a/init/util.cpp
++++ b/init/util.cpp
+@@ -41,9 +41,9 @@
+ #include <android-base/strings.h>
+ #include <android-base/unique_fd.h>
+ #include <cutils/sockets.h>
+-#include <selinux/android.h>
+ 
+ #if defined(__ANDROID__)
++#include <selinux/android.h>
+ #include <fs_mgr.h>
+ #endif
+ 
+@@ -94,19 +94,12 @@ Result<uid_t> DecodeUid(const std::string& name) {
+  */
+ Result<int> CreateSocket(const std::string& name, int type, bool passcred, bool should_listen,
+                          mode_t perm, uid_t uid, gid_t gid, const std::string& socketcon) {
+-    if (!socketcon.empty()) {
+-        if (setsockcreatecon(socketcon.c_str()) == -1) {
+-            return ErrnoError() << "setsockcreatecon(\"" << socketcon << "\") failed";
+-        }
+-    }
+ 
+     android::base::unique_fd fd(socket(PF_UNIX, type, 0));
+     if (fd < 0) {
+         return ErrnoError() << "Failed to open socket '" << name << "'";
+     }
+ 
+-    if (!socketcon.empty()) setsockcreatecon(nullptr);
+-
+     struct sockaddr_un addr;
+     memset(&addr, 0 , sizeof(addr));
+     addr.sun_family = AF_UNIX;
+@@ -116,11 +109,6 @@ Result<int> CreateSocket(const std::string& name, int type, bool passcred, bool
+         return ErrnoError() << "Failed to unlink old socket '" << name << "'";
+     }
+ 
+-    std::string secontext;
+-    if (SelabelLookupFileContext(addr.sun_path, S_IFSOCK, &secontext) && !secontext.empty()) {
+-        setfscreatecon(secontext.c_str());
+-    }
+-
+     if (passcred) {
+         int on = 1;
+         if (setsockopt(fd.get(), SOL_SOCKET, SO_PASSCRED, &on, sizeof(on))) {
+@@ -131,10 +119,6 @@ Result<int> CreateSocket(const std::string& name, int type, bool passcred, bool
+     int ret = bind(fd.get(), (struct sockaddr*)&addr, sizeof(addr));
+     int savederrno = errno;
+ 
+-    if (!secontext.empty()) {
+-        setfscreatecon(nullptr);
+-    }
+-
+     auto guard = android::base::make_scope_guard([&addr] { unlink(addr.sun_path); });
+ 
+     if (ret) {
+@@ -186,19 +170,7 @@ Result<std::string> ReadFile(const std::string& path) {
+ }
+ 
+ static int OpenFile(const std::string& path, int flags, mode_t mode) {
+-    std::string secontext;
+-    if (SelabelLookupFileContext(path, mode, &secontext) && !secontext.empty()) {
+-        setfscreatecon(secontext.c_str());
+-    }
+-
+     int rc = open(path.c_str(), flags, mode);
+-
+-    if (!secontext.empty()) {
+-        int save_errno = errno;
+-        setfscreatecon(nullptr);
+-        errno = save_errno;
+-    }
+-
+     return rc;
+ }
+ 
+@@ -244,20 +216,45 @@ int wait_for_file(const char* filename, std::chrono::nanoseconds timeout) {
+ }
+ 
+ bool make_dir(const std::string& path, mode_t mode) {
+-    std::string secontext;
+-    if (SelabelLookupFileContext(path, mode, &secontext) && !secontext.empty()) {
+-        setfscreatecon(secontext.c_str());
++    int rc = mkdir(path.c_str(), mode);
++    return rc == 0;
++}
++
++bool IsLegalPropertyName(const std::string& name) {
++    size_t namelen = name.size();
++
++    if (namelen < 1) return false;
++    if (name[0] == '.') return false;
++    if (name[namelen - 1] == '.') return false;
++
++    /* Only allow alphanumeric, plus '.', '-', '@', ':', or '_' */
++    /* Don't allow ".." to appear in a property name */
++    for (size_t i = 0; i < namelen; i++) {
++        if (name[i] == '.') {
++            // i=0 is guaranteed to never have a dot. See above.
++            if (name[i - 1] == '.') return false;
++            continue;
++        }
++        if (name[i] == '_' || name[i] == '-' || name[i] == '@' || name[i] == ':') continue;
++        if (name[i] >= 'a' && name[i] <= 'z') continue;
++        if (name[i] >= 'A' && name[i] <= 'Z') continue;
++        if (name[i] >= '0' && name[i] <= '9') continue;
++        return false;
+     }
+ 
+-    int rc = mkdir(path.c_str(), mode);
++    return true;
++}
+ 
+-    if (!secontext.empty()) {
+-        int save_errno = errno;
+-        setfscreatecon(nullptr);
+-        errno = save_errno;
++Result<void> IsLegalPropertyValue(const std::string& name, const std::string& value) {
++    if (value.size() >= PROP_VALUE_MAX && !StartsWith(name, "ro.")) {
++        return Error() << "Property value too long";
+     }
+ 
+-    return rc == 0;
++    if (mbstowcs(nullptr, value.data(), 0) == static_cast<std::size_t>(-1)) {
++        return Error() << "Value is not a UTF8 encoded string";
++    }
++
++    return {};
+ }
+ 
+ /*
+@@ -351,403 +348,6 @@ Result<std::string> ExpandProps(const std::string& src) {
+     return dst;
+ }
+ 
+-// Reads the content of device tree file under the platform's Android DT directory.
+-// Returns true if the read is success, false otherwise.
+-bool read_android_dt_file(const std::string& sub_path, std::string* dt_content) {
+-#if defined(__ANDROID__)
+-    const std::string file_name = android::fs_mgr::GetAndroidDtDir() + sub_path;
+-    if (android::base::ReadFileToString(file_name, dt_content)) {
+-        if (!dt_content->empty()) {
+-            dt_content->pop_back();  // Trims the trailing '\0' out.
+-            return true;
+-        }
+-    }
+-#endif
+-    return false;
+-}
+-
+-bool is_android_dt_value_expected(const std::string& sub_path, const std::string& expected_content) {
+-    std::string dt_content;
+-    if (read_android_dt_file(sub_path, &dt_content)) {
+-        if (dt_content == expected_content) {
+-            return true;
+-        }
+-    }
+-    return false;
+-}
+-
+-bool IsLegalPropertyName(const std::string& name) {
+-    size_t namelen = name.size();
+-
+-    if (namelen < 1) return false;
+-    if (name[0] == '.') return false;
+-    if (name[namelen - 1] == '.') return false;
+-
+-    /* Only allow alphanumeric, plus '.', '-', '@', ':', or '_' */
+-    /* Don't allow ".." to appear in a property name */
+-    for (size_t i = 0; i < namelen; i++) {
+-        if (name[i] == '.') {
+-            // i=0 is guaranteed to never have a dot. See above.
+-            if (name[i - 1] == '.') return false;
+-            continue;
+-        }
+-        if (name[i] == '_' || name[i] == '-' || name[i] == '@' || name[i] == ':') continue;
+-        if (name[i] >= 'a' && name[i] <= 'z') continue;
+-        if (name[i] >= 'A' && name[i] <= 'Z') continue;
+-        if (name[i] >= '0' && name[i] <= '9') continue;
+-        return false;
+-    }
+-
+-    return true;
+-}
+-
+-Result<void> IsLegalPropertyValue(const std::string& name, const std::string& value) {
+-    if (value.size() >= PROP_VALUE_MAX && !StartsWith(name, "ro.")) {
+-        return Error() << "Property value too long";
+-    }
+-
+-    if (mbstowcs(nullptr, value.data(), 0) == static_cast<std::size_t>(-1)) {
+-        return Error() << "Value is not a UTF8 encoded string";
+-    }
+-
+-    return {};
+-}
+-
+-// Remove unnecessary slashes so that any later checks (e.g., the check for
+-// whether the path is a top-level directory in /data) don't get confused.
+-std::string CleanDirPath(const std::string& path) {
+-    std::string result;
+-    result.reserve(path.length());
+-    // Collapse duplicate slashes, e.g. //data//foo// => /data/foo/
+-    for (char c : path) {
+-        if (c != '/' || result.empty() || result.back() != '/') {
+-            result += c;
+-        }
+-    }
+-    // Remove trailing slash, e.g. /data/foo/ => /data/foo
+-    if (result.length() > 1 && result.back() == '/') {
+-        result.pop_back();
+-    }
+-    return result;
+-}
+-
+-Result<MkdirOptions> ParseMkdir(const std::vector<std::string>& args) {
+-    std::string path = CleanDirPath(args[1]);
+-    const bool is_toplevel_data_dir =
+-            StartsWith(path, kDataDirPrefix) &&
+-            path.find_first_of('/', kDataDirPrefix.size()) == std::string::npos;
+-    FscryptAction fscrypt_action =
+-            is_toplevel_data_dir ? FscryptAction::kRequire : FscryptAction::kNone;
+-    mode_t mode = 0755;
+-    Result<uid_t> uid = -1;
+-    Result<gid_t> gid = -1;
+-    std::string ref_option = "ref";
+-    bool set_option_encryption = false;
+-    bool set_option_key = false;
+-
+-    for (size_t i = 2; i < args.size(); i++) {
+-        switch (i) {
+-            case 2:
+-                mode = std::strtoul(args[2].c_str(), 0, 8);
+-                break;
+-            case 3:
+-                uid = DecodeUid(args[3]);
+-                if (!uid.ok()) {
+-                    return Error()
+-                           << "Unable to decode UID for '" << args[3] << "': " << uid.error();
+-                }
+-                break;
+-            case 4:
+-                gid = DecodeUid(args[4]);
+-                if (!gid.ok()) {
+-                    return Error()
+-                           << "Unable to decode GID for '" << args[4] << "': " << gid.error();
+-                }
+-                break;
+-            default:
+-                auto parts = android::base::Split(args[i], "=");
+-                if (parts.size() != 2) {
+-                    return Error() << "Can't parse option: '" << args[i] << "'";
+-                }
+-                auto optname = parts[0];
+-                auto optval = parts[1];
+-                if (optname == "encryption") {
+-                    if (set_option_encryption) {
+-                        return Error() << "Duplicated option: '" << optname << "'";
+-                    }
+-                    if (optval == "Require") {
+-                        fscrypt_action = FscryptAction::kRequire;
+-                    } else if (optval == "None") {
+-                        fscrypt_action = FscryptAction::kNone;
+-                    } else if (optval == "Attempt") {
+-                        fscrypt_action = FscryptAction::kAttempt;
+-                    } else if (optval == "DeleteIfNecessary") {
+-                        fscrypt_action = FscryptAction::kDeleteIfNecessary;
+-                    } else {
+-                        return Error() << "Unknown encryption option: '" << optval << "'";
+-                    }
+-                    set_option_encryption = true;
+-                } else if (optname == "key") {
+-                    if (set_option_key) {
+-                        return Error() << "Duplicated option: '" << optname << "'";
+-                    }
+-                    if (optval == "ref" || optval == "per_boot_ref") {
+-                        ref_option = optval;
+-                    } else {
+-                        return Error() << "Unknown key option: '" << optval << "'";
+-                    }
+-                    set_option_key = true;
+-                } else {
+-                    return Error() << "Unknown option: '" << args[i] << "'";
+-                }
+-        }
+-    }
+-    if (set_option_key && fscrypt_action == FscryptAction::kNone) {
+-        return Error() << "Key option set but encryption action is none";
+-    }
+-    if (is_toplevel_data_dir) {
+-        if (!set_option_encryption) {
+-            LOG(WARNING) << "Top-level directory needs encryption action, eg mkdir " << path
+-                         << " <mode> <uid> <gid> encryption=Require";
+-        }
+-        if (fscrypt_action == FscryptAction::kNone) {
+-            LOG(INFO) << "Not setting encryption policy on: " << path;
+-        }
+-    }
+-
+-    return MkdirOptions{path, mode, *uid, *gid, fscrypt_action, ref_option};
+-}
+-
+-Result<MountAllOptions> ParseMountAll(const std::vector<std::string>& args) {
+-    bool compat_mode = false;
+-    bool import_rc = false;
+-    if (SelinuxGetVendorAndroidVersion() <= __ANDROID_API_Q__) {
+-        if (args.size() <= 1) {
+-            return Error() << "mount_all requires at least 1 argument";
+-        }
+-        compat_mode = true;
+-        import_rc = true;
+-    }
+-
+-    std::size_t first_option_arg = args.size();
+-    enum mount_mode mode = MOUNT_MODE_DEFAULT;
+-
+-    // If we are <= Q, then stop looking for non-fstab arguments at slot 2.
+-    // Otherwise, stop looking at slot 1 (as the fstab path argument is optional >= R).
+-    for (std::size_t na = args.size() - 1; na > (compat_mode ? 1 : 0); --na) {
+-        if (args[na] == "--early") {
+-            first_option_arg = na;
+-            mode = MOUNT_MODE_EARLY;
+-        } else if (args[na] == "--late") {
+-            first_option_arg = na;
+-            mode = MOUNT_MODE_LATE;
+-            import_rc = false;
+-        }
+-    }
+-
+-    std::string fstab_path;
+-    if (first_option_arg > 1) {
+-        fstab_path = args[1];
+-    } else if (compat_mode) {
+-        return Error() << "mount_all argument 1 must be the fstab path";
+-    }
+-
+-    std::vector<std::string> rc_paths;
+-    for (std::size_t na = 2; na < first_option_arg; ++na) {
+-        rc_paths.push_back(args[na]);
+-    }
+-
+-    return MountAllOptions{rc_paths, fstab_path, mode, import_rc};
+-}
+-
+-Result<std::pair<int, std::vector<std::string>>> ParseRestorecon(
+-        const std::vector<std::string>& args) {
+-    struct flag_type {
+-        const char* name;
+-        int value;
+-    };
+-    static const flag_type flags[] = {
+-            {"--recursive", SELINUX_ANDROID_RESTORECON_RECURSE},
+-            {"--skip-ce", SELINUX_ANDROID_RESTORECON_SKIPCE},
+-            {"--cross-filesystems", SELINUX_ANDROID_RESTORECON_CROSS_FILESYSTEMS},
+-            {0, 0}};
+-
+-    int flag = 0;
+-    std::vector<std::string> paths;
+-
+-    bool in_flags = true;
+-    for (size_t i = 1; i < args.size(); ++i) {
+-        if (android::base::StartsWith(args[i], "--")) {
+-            if (!in_flags) {
+-                return Error() << "flags must precede paths";
+-            }
+-            bool found = false;
+-            for (size_t j = 0; flags[j].name; ++j) {
+-                if (args[i] == flags[j].name) {
+-                    flag |= flags[j].value;
+-                    found = true;
+-                    break;
+-                }
+-            }
+-            if (!found) {
+-                return Error() << "bad flag " << args[i];
+-            }
+-        } else {
+-            in_flags = false;
+-            paths.emplace_back(args[i]);
+-        }
+-    }
+-    return std::pair(flag, paths);
+-}
+-
+-Result<std::string> ParseSwaponAll(const std::vector<std::string>& args) {
+-    if (args.size() <= 1) {
+-        if (SelinuxGetVendorAndroidVersion() <= __ANDROID_API_Q__) {
+-            return Error() << "swapon_all requires at least 1 argument";
+-        }
+-        return {};
+-    }
+-    return args[1];
+-}
+-
+-Result<std::string> ParseUmountAll(const std::vector<std::string>& args) {
+-    if (args.size() <= 1) {
+-        if (SelinuxGetVendorAndroidVersion() <= __ANDROID_API_Q__) {
+-            return Error() << "umount_all requires at least 1 argument";
+-        }
+-        return {};
+-    }
+-    return args[1];
+-}
+-
+-static void InitAborter(const char* abort_message) {
+-    // When init forks, it continues to use this aborter for LOG(FATAL), but we want children to
+-    // simply abort instead of trying to reboot the system.
+-    if (getpid() != 1) {
+-        android::base::DefaultAborter(abort_message);
+-        return;
+-    }
+-
+-    InitFatalReboot(SIGABRT);
+-}
+-
+-// The kernel opens /dev/console and uses that fd for stdin/stdout/stderr if there is a serial
+-// console enabled and no initramfs, otherwise it does not provide any fds for stdin/stdout/stderr.
+-// SetStdioToDevNull() is used to close these existing fds if they exist and replace them with
+-// /dev/null regardless.
+-//
+-// In the case that these fds are provided by the kernel, the exec of second stage init causes an
+-// SELinux denial as it does not have access to /dev/console.  In the case that they are not
+-// provided, exec of any further process is potentially dangerous as the first fd's opened by that
+-// process will take the stdin/stdout/stderr fileno's, which can cause issues if printf(), etc is
+-// then used by that process.
+-//
+-// Lastly, simply calling SetStdioToDevNull() in first stage init is not enough, since first
+-// stage init still runs in kernel context, future child processes will not have permissions to
+-// access any fds that it opens, including the one opened below for /dev/null.  Therefore,
+-// SetStdioToDevNull() must be called again in second stage init.
+-void SetStdioToDevNull(char** argv) {
+-    // Make stdin/stdout/stderr all point to /dev/null.
+-    int fd = open("/dev/null", O_RDWR);  // NOLINT(android-cloexec-open)
+-    if (fd == -1) {
+-        int saved_errno = errno;
+-        android::base::InitLogging(argv, &android::base::KernelLogger, InitAborter);
+-        errno = saved_errno;
+-        PLOG(FATAL) << "Couldn't open /dev/null";
+-    }
+-    dup2(fd, STDIN_FILENO);
+-    dup2(fd, STDOUT_FILENO);
+-    dup2(fd, STDERR_FILENO);
+-    if (fd > STDERR_FILENO) close(fd);
+-}
+-
+-void InitKernelLogging(char** argv) {
+-    SetFatalRebootTarget();
+-    android::base::InitLogging(argv, &android::base::KernelLogger, InitAborter);
+-}
+-
+-bool IsRecoveryMode() {
+-    return access("/system/bin/recovery", F_OK) == 0;
+-}
+-
+-// Check if default mount namespace is ready to be used with APEX modules
+-static bool is_default_mount_namespace_ready = false;
+-
+-bool IsDefaultMountNamespaceReady() {
+-    return is_default_mount_namespace_ready;
+-}
+-
+-void SetDefaultMountNamespaceReady() {
+-    is_default_mount_namespace_ready = true;
+-}
+-
+-bool Has32BitAbi() {
+-    static bool has = !android::base::GetProperty("ro.product.cpu.abilist32", "").empty();
+-    return has;
+-}
+-
+-std::string GetApexNameFromFileName(const std::string& path) {
+-    static const std::string kApexDir = "/apex/";
+-    if (StartsWith(path, kApexDir)) {
+-        auto begin = kApexDir.size();
+-        auto end = path.find('/', begin);
+-        return path.substr(begin, end - begin);
+-    }
+-    return "";
+-}
+-
+-std::vector<std::string> FilterVersionedConfigs(const std::vector<std::string>& configs,
+-                                                int active_sdk) {
+-    std::vector<std::string> filtered_configs;
+-
+-    std::map<std::string, std::pair<std::string, int>> script_map;
+-    for (const auto& c : configs) {
+-        int sdk = 0;
+-        const std::vector<std::string> parts = android::base::Split(c, ".");
+-        std::string base;
+-        if (parts.size() < 2) {
+-            continue;
+-        }
+-
+-        // parts[size()-1], aka the suffix, should be "rc" or "#rc"
+-        // any other pattern gets discarded
+-
+-        const auto& suffix = parts[parts.size() - 1];
+-        if (suffix == "rc") {
+-            sdk = 0;
+-        } else {
+-            char trailer[9] = {0};
+-            int r = sscanf(suffix.c_str(), "%d%8s", &sdk, trailer);
+-            if (r != 2) {
+-                continue;
+-            }
+-            if (strlen(trailer) > 2 || strcmp(trailer, "rc") != 0) {
+-                continue;
+-            }
+-        }
+-
+-        if (sdk < 0 || sdk > active_sdk) {
+-            continue;
+-        }
+-
+-        base = parts[0];
+-        for (unsigned int i = 1; i < parts.size() - 1; i++) {
+-            base = base + "." + parts[i];
+-        }
+-
+-        // is this preferred over what we already have
+-        auto it = script_map.find(base);
+-        if (it == script_map.end() || it->second.second < sdk) {
+-            script_map[base] = std::make_pair(c, sdk);
+-        }
+-    }
+-
+-    for (const auto& m : script_map) {
+-        filtered_configs.push_back(m.second.first);
+-    }
+-    return filtered_configs;
+-}
+-
+ // Forks, executes the provided program in the child, and waits for the completion in the parent.
+ // Child's stderr is captured and logged using LOG(ERROR).
+ bool ForkExecveAndWaitForCompletion(const char* filename, char* const argv[]) {
+diff --git a/property_service/libpropertyinfoserializer/trie_node_arena.h b/property_service/libpropertyinfoserializer/trie_node_arena.h
+index 5e0ef82731..62f29ab3a4 100644
+--- a/property_service/libpropertyinfoserializer/trie_node_arena.h
++++ b/property_service/libpropertyinfoserializer/trie_node_arena.h
+@@ -19,6 +19,9 @@
+ 
+ #include <string>
+ #include <vector>
++#ifndef __ANDROID__
++#include <cstring>
++#endif
+ 
+ namespace android {
+ namespace properties {
+-- 
+2.34.1
+

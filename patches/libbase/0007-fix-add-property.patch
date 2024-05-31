@@ -1,0 +1,28 @@
+From a90a34a623abce51837726815f61bf20cfa61fd3 Mon Sep 17 00:00:00 2001
+From: chunhuachen <chunhuachen@ruijie.com.cn>
+Date: Thu, 30 May 2024 11:36:33 +0800
+Subject: [PATCH] fix add property
+
+---
+ properties.cpp | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/properties.cpp b/properties.cpp
+index a20db54..f44c568 100644
+--- a/properties.cpp
++++ b/properties.cpp
+@@ -14,6 +14,11 @@
+  * limitations under the License.
+  */
+ 
++#include <features.h>
++#if defined(__GLIBC__)
++#define __BIONIC__ 1
++#include <cutils/memory.h>
++#endif
+ #include "android-base/properties.h"
+ 
+ #if defined(__BIONIC__)
+-- 
+2.34.1
+

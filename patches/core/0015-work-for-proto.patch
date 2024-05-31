@@ -1,0 +1,370 @@
+From 359cf29216d99b9a8be2452d1cd0bd82aa8cbe0a Mon Sep 17 00:00:00 2001
+From: chunhuachen <chunhuachen@ruijie.com.cn>
+Date: Fri, 31 May 2024 14:42:15 +0800
+Subject: [PATCH] work for proto
+
+---
+ init/persistent_properties.cpp                |   4 +-
+ init/property_service.cpp                     | 150 ++----------------
+ init/property_service.h                       |   2 -
+ libcutils/include/cutils/sockets.h            |   4 +
+ .../property_info_parser.h                    |   2 +-
+ .../property_info_parser.cpp                  |   2 +-
+ toolbox/getprop.cpp                           |   1 +
+ toolbox/tools.h                               |   8 +-
+ 8 files changed, 23 insertions(+), 150 deletions(-)
+
+diff --git a/init/persistent_properties.cpp b/init/persistent_properties.cpp
+index 6f8a4de93d..30d330664d 100644
+--- a/init/persistent_properties.cpp
++++ b/init/persistent_properties.cpp
+@@ -40,11 +40,11 @@ using android::base::WriteStringToFd;
+ namespace android {
+ namespace init {
+ 
+-std::string persistent_property_filename = "/data/property/persistent_properties";
++std::string persistent_property_filename = "/var/run/property/persistent_properties";
+ 
+ namespace {
+ 
+-constexpr const char kLegacyPersistentPropertyDir[] = "/data/property";
++constexpr const char kLegacyPersistentPropertyDir[] = "/var/run/property";
+ 
+ void AddPersistentProperty(const std::string& name, const std::string& value,
+                            PersistentProperties* persistent_properties) {
+diff --git a/init/property_service.cpp b/init/property_service.cpp
+index 9e2e57af4f..ae09d13972 100644
+--- a/init/property_service.cpp
++++ b/init/property_service.cpp
+@@ -81,10 +81,6 @@
+ #include "property_service.pb.h"
+ #include "util.h"
+ 
+-static constexpr char APPCOMPAT_OVERRIDE_PROP_FOLDERNAME[] =
+-        "/dev/__properties__/appcompat_override";
+-static constexpr char APPCOMPAT_OVERRIDE_PROP_TREE_FILE[] =
+-        "/dev/__properties__/appcompat_override/property_info";
+ using namespace std::literals;
+ 
+ using android::base::ErrnoError;
+@@ -131,11 +127,6 @@ static std::unique_ptr<PersistWriteThread> persist_write_thread;
+ 
+ static PropertyInfoAreaFile property_info_area;
+ 
+-struct PropertyAuditData {
+-    const ucred* cr;
+-    const char* name;
+-};
+-
+ void StartSendingMessages() {
+     auto lock = std::lock_guard{accept_messages_lock};
+     accept_messages = true;
+@@ -156,43 +147,6 @@ void NotifyPropertyChange(const std::string& name, const std::string& value) {
+     }
+ }
+ 
+-class AsyncRestorecon {
+-  public:
+-    void TriggerRestorecon(const std::string& path) {
+-        auto guard = std::lock_guard{mutex_};
+-        paths_.emplace(path);
+-
+-        if (!thread_started_) {
+-            thread_started_ = true;
+-            std::thread{&AsyncRestorecon::ThreadFunction, this}.detach();
+-        }
+-    }
+-
+-  private:
+-    void ThreadFunction() {
+-        auto lock = std::unique_lock{mutex_};
+-
+-        while (!paths_.empty()) {
+-            auto path = paths_.front();
+-            paths_.pop();
+-
+-            lock.unlock();
+-            //TODO
+-            //if (selinux_android_restorecon(path.c_str(), SELINUX_ANDROID_RESTORECON_RECURSE) != 0) {
+-                LOG(ERROR) << "Asynchronous restorecon of '" << path << "' failed'";
+-            //}
+-            android::base::SetProperty(kRestoreconProperty, path);
+-            lock.lock();
+-        }
+-
+-        thread_started_ = false;
+-    }
+-
+-    std::mutex mutex_;
+-    std::queue<std::string> paths_;
+-    bool thread_started_ = false;
+-};
+-
+ class SocketConnection {
+   public:
+     SocketConnection() = default;
+@@ -416,11 +370,6 @@ std::optional<uint32_t> HandlePropertySet(const std::string& name, const std::st
+     // requesting that init performs a restorecon operation on the path specified by 'value'.
+     // We use a thread to do this restorecon operation to prevent holding up init, as it may take
+     // a long time to complete.
+-    if (name == kRestoreconProperty && cr.pid != 1 && !value.empty()) {
+-        static AsyncRestorecon async_restorecon;
+-        async_restorecon.TriggerRestorecon(value);
+-        return {PROP_SUCCESS};
+-    }
+ 
+     return PropertySet(name, value, socket, error);
+ }
+@@ -555,22 +504,6 @@ static void LoadProperties(char* data, const char* filter, const char* filename,
+     char *key, *value, *eol, *sol, *tmp, *fn;
+     size_t flen = 0;
+ 
+-    static constexpr const char* const kVendorPathPrefixes[4] = {
+-            "/vendor",
+-            "/odm",
+-            "/vendor_dlkm",
+-            "/odm_dlkm",
+-    };
+-
+-    const char* context = kInitContext;
+-    if (SelinuxGetVendorAndroidVersion() >= __ANDROID_API_P__) {
+-        for (const auto& vendor_path_prefix : kVendorPathPrefixes) {
+-            if (StartsWith(filename, vendor_path_prefix)) {
+-                context = kVendorContext;
+-            }
+-        }
+-    }
+-
+     if (filter) {
+         flen = strlen(filter);
+     }
+@@ -627,8 +560,8 @@ static void LoadProperties(char* data, const char* filter, const char* filename,
+                 }
+             }
+ 
+-            if (StartsWith(key, "ctl.") || key == "sys.powerctl"s ||
+-                std::string{key} == kRestoreconProperty) {
++            if (StartsWith(key, "ctl.") || key == "sys.powerctl"s)
++            {
+                 LOG(ERROR) << "Ignoring disallowed property '" << key
+                            << "' with special meaning in prop file '" << filename << "'";
+                 continue;
+@@ -636,7 +569,7 @@ static void LoadProperties(char* data, const char* filter, const char* filename,
+ 
+             ucred cr = {.pid = 1, .uid = 0, .gid = 0};
+             std::string error;
+-            if (CheckPermissions(key, value, context, cr, &error) == PROP_SUCCESS) {
++            if (CheckPermissions(key, value, kInitContext, cr, &error) == PROP_SUCCESS) {
+                 auto it = properties->find(key);
+                 if (it == properties->end()) {
+                     (*properties)[key] = value;
+@@ -670,18 +603,6 @@ static Result<void> load_properties_from_file(const char* filename, const char*
+     return {};
+ }
+ 
+-static void LoadPropertiesFromSecondStageRes(std::map<std::string, std::string>* properties) {
+-    std::string prop = GetRamdiskPropForSecondStage();
+-    if (access(prop.c_str(), R_OK) != 0) {
+-        CHECK(errno == ENOENT) << "Cannot access " << prop << ": " << strerror(errno);
+-        return;
+-    }
+-    if (auto res = load_properties_from_file(prop.c_str(), nullptr, properties); !res.ok()) {
+-        LOG(WARNING) << res.error();
+-    }
+-}
+-
+-
+ static void load_override_properties() {
+     if (ALLOW_LOCAL_PROP_OVERRIDE) {
+         std::map<std::string, std::string> properties;
+@@ -966,28 +887,15 @@ void PropertyLoadBootDefaults() {
+         }
+     };
+ 
+-    // Order matters here. The more the partition is specific to a product, the higher its
+-    // precedence is.
+-    LoadPropertiesFromSecondStageRes(&properties);
+-
+     // system should have build.prop, unlike the other partitions
+-    if (auto res = load_properties_from_file("/system/build.prop", nullptr, &properties);
++    if (auto res = load_properties_from_file("/usr/share/dev_cap/build.prop", nullptr, &properties);
+         !res.ok()) {
+         LOG(WARNING) << res.error();
+     }
+ 
+-    load_properties_from_partition("system_ext", /* support_legacy_path_until */ 30);
+-    load_properties_from_file("/system_dlkm/etc/build.prop", nullptr, &properties);
+-    // TODO(b/117892318): uncomment the following condition when vendor.imgs for aosp_* targets are
+-    // all updated.
+-    if (SelinuxGetVendorAndroidVersion() <= __ANDROID_API_R__) {
+-        load_properties_from_file("/vendor/default.prop", nullptr, &properties);
+-    }
+-    load_properties_from_file("/vendor/build.prop", nullptr, &properties);
+-    load_properties_from_file("/vendor_dlkm/etc/build.prop", nullptr, &properties);
+-    load_properties_from_file("/odm_dlkm/etc/build.prop", nullptr, &properties);
+-    load_properties_from_partition("odm", /* support_legacy_path_until */ 28);
+-    load_properties_from_partition("product", /* support_legacy_path_until */ 30);
++    load_properties_from_file("/etc/build.prop", nullptr, &properties);
++
++    load_properties_from_partition("var", /* support_legacy_path_until */ 30);
+ 
+     for (const auto& [name, value] : properties) {
+         std::string error;
+@@ -1026,38 +934,6 @@ bool LoadPropertyInfoFromFile(const std::string& filename,
+ 
+ void CreateSerializedPropertyInfo() {
+     auto property_infos = std::vector<PropertyInfoEntry>();
+-    if (access("/system/etc/selinux/plat_property_contexts", R_OK) != -1) {
+-        if (!LoadPropertyInfoFromFile("/system/etc/selinux/plat_property_contexts",
+-                                      &property_infos)) {
+-            return;
+-        }
+-        // Don't check for failure here, since we don't always have all of these partitions.
+-        // E.g. In case of recovery, the vendor partition will not have mounted and we
+-        // still need the system / platform properties to function.
+-        if (access("/system_ext/etc/selinux/system_ext_property_contexts", R_OK) != -1) {
+-            LoadPropertyInfoFromFile("/system_ext/etc/selinux/system_ext_property_contexts",
+-                                     &property_infos);
+-        }
+-        if (access("/vendor/etc/selinux/vendor_property_contexts", R_OK) != -1) {
+-            LoadPropertyInfoFromFile("/vendor/etc/selinux/vendor_property_contexts",
+-                                     &property_infos);
+-        }
+-        if (access("/product/etc/selinux/product_property_contexts", R_OK) != -1) {
+-            LoadPropertyInfoFromFile("/product/etc/selinux/product_property_contexts",
+-                                     &property_infos);
+-        }
+-        if (access("/odm/etc/selinux/odm_property_contexts", R_OK) != -1) {
+-            LoadPropertyInfoFromFile("/odm/etc/selinux/odm_property_contexts", &property_infos);
+-        }
+-    } else {
+-        if (!LoadPropertyInfoFromFile("/plat_property_contexts", &property_infos)) {
+-            return;
+-        }
+-        LoadPropertyInfoFromFile("/system_ext_property_contexts", &property_infos);
+-        LoadPropertyInfoFromFile("/vendor_property_contexts", &property_infos);
+-        LoadPropertyInfoFromFile("/product_property_contexts", &property_infos);
+-        LoadPropertyInfoFromFile("/odm_property_contexts", &property_infos);
+-    }
+ 
+     auto serialized_contexts = std::string();
+     auto error = std::string();
+@@ -1070,12 +946,6 @@ void CreateSerializedPropertyInfo() {
+     if (!WriteStringToFile(serialized_contexts, PROP_TREE_FILE, 0444, 0, 0, false)) {
+         PLOG(ERROR) << "Unable to write serialized property infos to file";
+     }
+-
+-    mkdir(APPCOMPAT_OVERRIDE_PROP_FOLDERNAME, S_IRWXU | S_IXGRP | S_IXOTH);
+-    if (!WriteStringToFile(serialized_contexts, APPCOMPAT_OVERRIDE_PROP_TREE_FILE, 0444, 0, 0,
+-                           false)) {
+-        PLOG(ERROR) << "Unable to write appcompat override property infos to file";
+-    }
+ }
+ 
+ static void ExportKernelBootProps() {
+@@ -1105,8 +975,7 @@ constexpr auto ANDROIDBOOT_PREFIX = "androidboot."sv;
+ 
+ 
+ void PropertyInit() {
+-
+-    mkdir("/dev/__properties__", S_IRWXU | S_IXGRP | S_IXOTH);
++    mkdir("/run/__properties__", S_IRWXU | S_IXGRP | S_IXOTH);
+     CreateSerializedPropertyInfo();
+     if (__system_property_area_init()) {
+         LOG(FATAL) << "Failed to initialize property area";
+@@ -1229,7 +1098,8 @@ void StartPropertyService(int* epoll_socket) {
+     }
+     *epoll_socket = from_init_socket = sockets[0];
+     init_socket = sockets[1];
+-    StartSendingMessages();
++    //StartSendingMessages();
++    LOG(INFO) << "ro.property_service.version:" << android::base::GetProperty("ro.property_service.version", "unknown");
+ 
+     if (auto result = CreateSocket(PROP_SERVICE_NAME, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK,
+                                    /*passcred=*/false, /*should_listen=*/false, 0666, /*uid=*/0,
+diff --git a/init/property_service.h b/init/property_service.h
+index 71a609cf78..da28d9eaae 100644
+--- a/init/property_service.h
++++ b/init/property_service.h
+@@ -29,8 +29,6 @@
+ namespace android {
+ namespace init {
+ 
+-static constexpr const char kRestoreconProperty[] = "selinux.restorecon_recursive";
+-
+ bool CanReadProperty(const std::string& source_context, const std::string& name);
+ 
+ void PropertyInit();
+diff --git a/libcutils/include/cutils/sockets.h b/libcutils/include/cutils/sockets.h
+index be21a8f7f7..feb22cf1d6 100644
+--- a/libcutils/include/cutils/sockets.h
++++ b/libcutils/include/cutils/sockets.h
+@@ -42,7 +42,11 @@ typedef int cutils_socket_t;
+ #endif
+ 
+ #define ANDROID_SOCKET_ENV_PREFIX	"ANDROID_SOCKET_"
++#ifdef __ANDROID__
+ #define ANDROID_SOCKET_DIR		"/dev/socket"
++#else
++#define ANDROID_SOCKET_DIR		"/run"
++#endif
+ 
+ #ifdef __cplusplus
+ extern "C" {
+diff --git a/property_service/libpropertyinfoparser/include/property_info_parser/property_info_parser.h b/property_service/libpropertyinfoparser/include/property_info_parser/property_info_parser.h
+index 65705accbc..8ba78c8310 100644
+--- a/property_service/libpropertyinfoparser/include/property_info_parser/property_info_parser.h
++++ b/property_service/libpropertyinfoparser/include/property_info_parser/property_info_parser.h
+@@ -20,7 +20,7 @@
+ #include <stdint.h>
+ #include <stdlib.h>
+ 
+-static constexpr char PROP_TREE_FILE[] = "/dev/__properties__/property_info";
++static constexpr char PROP_TREE_FILE[] = "/run/__properties__/property_info";
+ 
+ namespace android {
+ namespace properties {
+diff --git a/property_service/libpropertyinfoparser/property_info_parser.cpp b/property_service/libpropertyinfoparser/property_info_parser.cpp
+index 489d81a67c..edc9333bc9 100644
+--- a/property_service/libpropertyinfoparser/property_info_parser.cpp
++++ b/property_service/libpropertyinfoparser/property_info_parser.cpp
+@@ -193,7 +193,7 @@ void PropertyInfoArea::GetPropertyInfo(const char* property, const char** contex
+ }
+ 
+ bool PropertyInfoAreaFile::LoadDefaultPath() {
+-  return LoadPath("/dev/__properties__/property_info");
++  return LoadPath("/run/__properties__/property_info");
+ }
+ 
+ bool PropertyInfoAreaFile::LoadPath(const char* filename) {
+diff --git a/toolbox/getprop.cpp b/toolbox/getprop.cpp
+index ca345cb071..f490f4338b 100644
+--- a/toolbox/getprop.cpp
++++ b/toolbox/getprop.cpp
+@@ -90,6 +90,7 @@ void PrintProperty(const char* name, const char* default_value, ResultType resul
+     }
+ }
+ 
++extern "C" int __system_properties_init(void);
+ extern "C" int getprop_main(int argc, char** argv) {
+     auto result_type = ResultType::Value;
+ 
+diff --git a/toolbox/tools.h b/toolbox/tools.h
+index bb57e67782..f58ca2c182 100644
+--- a/toolbox/tools.h
++++ b/toolbox/tools.h
+@@ -1,7 +1,7 @@
+-TOOL(getevent)
++//TOOL(getevent)
+ TOOL(getprop)
+-TOOL(modprobe)
++//TOOL(modprobe)
+ TOOL(setprop)
+-TOOL(start)
+-TOOL(stop)
++//TOOL(start)
++//TOOL(stop)
+ TOOL(toolbox)
+-- 
+2.34.1
+
