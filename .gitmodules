@@ -70,3 +70,6 @@
 	shallow = true
 	path = vendor/bionic
 	url = https://git.codelinaro.org/clo/la/platform/bionic.git
+[submodule "vendor/sysprop"]
+	path = vendor/sysprop
+	url = https://github.com/luchachen/sysprop.git
