@@ -1,0 +1,65 @@
+From f5f4b6bb82ff06206b2eda911c2776c3628c3de8 Mon Sep 17 00:00:00 2001
+From: chunhuachen <chunhuachen@ruijie.com.cn>
+Date: Tue, 4 Jun 2024 20:10:56 +0800
+Subject: [PATCH] fix build on c++17
+
+---
+ init/epoll.cpp                                            | 1 +
+ init/property_service.cpp                                 | 3 ++-
+ property_service/libpropertyinfoserializer/trie_builder.h | 1 +
+ toolbox/getprop.cpp                                       | 1 +
+ 4 files changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/init/epoll.cpp b/init/epoll.cpp
+index bef75f72a1..475b53f4b2 100644
+--- a/init/epoll.cpp
++++ b/init/epoll.cpp
+@@ -22,6 +22,7 @@
+ #include <chrono>
+ #include <functional>
+ #include <map>
++#include <climits>
+ 
+ #include <android-base/logging.h>
+ 
+diff --git a/init/property_service.cpp b/init/property_service.cpp
+index ae09d13972..476a01a69a 100644
+--- a/init/property_service.cpp
++++ b/init/property_service.cpp
+@@ -143,7 +143,8 @@ void NotifyPropertyChange(const std::string& name, const std::string& value) {
+     // anyway, so there's no need to try to send them.
+     auto lock = std::lock_guard{accept_messages_lock};
+     if (accept_messages) {
+-        PropertyChanged(name, value);
++        //TODO
++        //PropertyChanged(name, value);
+     }
+ }
+ 
+diff --git a/property_service/libpropertyinfoserializer/trie_builder.h b/property_service/libpropertyinfoserializer/trie_builder.h
+index b971589fe4..9290320457 100644
+--- a/property_service/libpropertyinfoserializer/trie_builder.h
++++ b/property_service/libpropertyinfoserializer/trie_builder.h
+@@ -21,6 +21,7 @@
+ #include <set>
+ #include <string>
+ #include <vector>
++#include <algorithm>
+ 
+ namespace android {
+ namespace properties {
+diff --git a/toolbox/getprop.cpp b/toolbox/getprop.cpp
+index f490f4338b..0fcd4b659c 100644
+--- a/toolbox/getprop.cpp
++++ b/toolbox/getprop.cpp
+@@ -17,6 +17,7 @@
+ #include <getopt.h>
+ #include <sys/system_properties.h>
+ 
++#include <algorithm>
+ #include <iostream>
+ #include <string>
+ #include <vector>
+-- 
+2.34.1
+
