@@ -73,3 +73,6 @@
 [submodule "vendor/sysprop"]
 	path = vendor/sysprop
 	url = https://github.com/luchachen/sysprop.git
+[submodule "vendor/system/memory/lmkd"]
+	path = vendor/system/memory/lmkd
+	url = https://git.codelinaro.org/clo/la/platform/system/memory/lmkd.git
