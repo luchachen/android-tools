@@ -5,7 +5,6 @@ add_library(libbase STATIC
     libbase/file.cpp
     libbase/hex.cpp
     libbase/logging.cpp
-    libbase/mapped_file.cpp
     libbase/parsebool.cpp
     libbase/parsenetaddress.cpp
     libbase/posix_strerror_r.cpp
@@ -19,5 +18,5 @@ add_library(libbase STATIC
 
 target_include_directories(libbase PUBLIC
 	sysprop/bionic/libc/include
-	libbase/include core/include)
+	libbase/include)
 target_link_libraries(libbase PUBLIC fmt::fmt liblog)

@@ -7,7 +7,7 @@ set(CMAKE_C_EXTENSIONS ON)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
 # Use C++20 with GNU extensions.
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_EXTENSIONS ON)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -103,43 +103,13 @@ include_directories(${PROTOBUF_INCLUDE_DIRS})
 include_directories(${CMAKE_CURRENT_BINARY_DIR})
 
 include(CMakeLists.libbase.txt)
-include(CMakeLists.libandroidfw.txt)
-include(CMakeLists.adb.txt)
 include(CMakeLists.sysprop.txt)
-include(CMakeLists.sparse.txt)
-include(CMakeLists.fastboot.txt)
-include(CMakeLists.f2fstools.txt)
-include(CMakeLists.mke2fs.txt)
-include(CMakeLists.partition.txt)
-include(CMakeLists.mkbootimg.txt)
-include(CMakeLists.libufdt.txt)
-include(CMakeLists.avb.txt)
 
 # Targets which should be installed by `make install`.
 install(TARGETS
-	"${ANDROID_MKE2FS_NAME}"
-	adb
 	propd
 	toolbox
-	append2simg
-	fastboot
-	img2simg
-	lpadd
-	lpdump
-	lpflash
-	lpmake
-	lpunpack
-	make_f2fs
-	sload_f2fs
-	simg2img
-	ext2simg
 	DESTINATION bin)
-
-if(NOT APPLE)
-	install(TARGETS
-		e2fsdroid
-		DESTINATION bin)
-endif()
 
 # Install common completion files.
 install(FILES adb/adb.bash RENAME adb DESTINATION "${COMPLETION_COMMON_DIR}")

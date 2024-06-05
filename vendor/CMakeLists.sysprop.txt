@@ -1,26 +1,19 @@
-protobuf_generate_cpp(PERSISTENT_PROPERTIES_PROTO_SRCS PERSISTENT_PROPERTIES_PROTO_HDRS
-	core/init/persistent_properties.proto)
-protobuf_generate_cpp(PROPERTY_SERVICE_PROTO_SRCS PROPERTY_SERVICE_PROTO_HDRS
-	core/init/property_service.proto)
+add_library(liblog STATIC
+	logging/liblog/log_event_list.cpp
+	logging/liblog/log_event_write.cpp
+	logging/liblog/logger_name.cpp
+	logging/liblog/logger_read.cpp
+	logging/liblog/logger_write.cpp
+	logging/liblog/properties.cpp
+	logging/liblog/logprint.cpp)
 
-# No fastdeploy because it requires deployagent.inc
-set(propd_helpers_SOURCES
-	core/init/persistent_properties.cpp
-	core/init/property_service.cpp
-	core/init/property_type.cpp
-	core/init/epoll.cpp
-	core/init/util.cpp
-	${PERSISTENT_PROPERTIES_PROTO_SRCS} ${PERSISTENT_PROPERTIES_PROTO_HDRS}
-	${PROPERTY_SERVICE_PROTO_SRCS} ${PROPERTY_SERVICE_PROTO_HDRS})
+target_compile_definitions(liblog PRIVATE
+	-DLIBLOG_LOG_TAG=1006 -D_XOPEN_SOURCE=700 -DFAKE_LOG_DEVICE=1)
+target_include_directories(liblog PUBLIC
+	logging/liblog/include
+	core/libcutils/include)
 
-
-add_library(propd_helpers SHARED ${propd_helpers_SOURCES})
-target_compile_definitions(propd_helpers PRIVATE -D_GNU_SOURCE)
-target_compile_definitions(propd_helpers PUBLIC -DPROP_HOST=1)
-target_include_directories(propd_helpers PUBLIC
-	core/init)
-
-target_link_libraries(propd_helpers PRIVATE propertyinfoserializer libbase systemproperties)
+target_link_libraries(liblog PRIVATE libbase)
 
 #core/property_service/property_info_checker/property_info_checker.cpp
 set(propertyinfoparser_SOURCES
@@ -41,7 +34,7 @@ set(propertyinfoserializer_SOURCES
 	core/property_service/libpropertyinfoserializer/trie_builder.cpp
 	core/property_service/libpropertyinfoserializer/property_info_file.cpp)
 
-add_library(propertyinfoserializer SHARED ${propertyinfoserializer_SOURCES})
+add_library(propertyinfoserializer STATIC ${propertyinfoserializer_SOURCES})
 target_compile_definitions(propertyinfoserializer PRIVATE -D_GNU_SOURCE)
 target_compile_definitions(propertyinfoserializer PUBLIC -DPROP_HOST=1 -DALLOW_LOCAL_PROP_OVERRIDE=1)
 
@@ -76,18 +69,27 @@ target_include_directories(systemproperties PUBLIC
 target_link_libraries(systemproperties PUBLIC propertyinfoparser)
 
 add_executable(propd
-	sysprop/propd/propd.cpp)
+	sysprop/propd/main.cpp
+	sysprop/propd/propd.cpp
+	sysprop/propd/persistent_properties.cpp
+	sysprop/propd/property_service.cpp
+	sysprop/propd/property_type.cpp
+	sysprop/propd/sigchld_handler.cpp
+	sysprop/propd/util.cpp
+	)
 
-target_link_libraries(propd
+target_compile_definitions(propd PRIVATE -D_GNU_SOURCE)
+target_compile_definitions(propd PUBLIC -DPROP_HOST=1 -DALLOW_LOCAL_PROP_OVERRIDE=1)
+
+target_link_libraries(propd PRIVATE
 	libbase
-	propd_helpers
-	systemproperties
-	protobuf::libprotobuf-lite)
+	propertyinfoserializer
+	systemproperties)
 
 add_executable(toolbox
 	core/toolbox/toolbox.c
-	core/toolbox/getprop.cpp
-	core/toolbox/setprop.cpp)
+	core/toolbox/setprop.cpp
+	core/toolbox/getprop.cpp)
 
 target_link_libraries(toolbox
 	libbase
